@@ -1,0 +1,7 @@
+# Multimodal Insurance Claims Agent Engine
+
+An advanced automated claims verification system designed to evaluate asset damage (cars, laptops, packages), cross-reference behavioral customer risk history, and output structured verification metrics.
+
+### Key Architectural Features:
+- **Resilient Fallback Engine:** Features localized deterministic string parsing to handle external API rate limits (429 errors).
+- **Taxonomy Enforcement:** Guarantees strict structured alignment with target evaluation criteria.
