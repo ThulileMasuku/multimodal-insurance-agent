@@ -1,0 +1,2 @@
+user_id,image_paths,user_claim,claim_object,evidence_standard_met,evidence_standard_met_reason,risk_flags,issue_type,object_part,claim_status,claim_status_justification,supporting_image_ids,valid_image,severity
+usr_002,dataset/images/claim_002.png,The front bumper has a deep dent from backing into a post.,car,true,Visual validation assets verified locally.,none,dent,front_bumper,supported,Verified against localized multimodal contextual logic.,claim_002,true,medium
