@@ -1,95 +1,124 @@
 import os
-import torch
+import glob
+import json
+import time
 import pandas as pd
-from agent import LocalVisionAgent
+from PIL import Image
+from google import genai
+from google.genai import types
 
-def main():
-    DATASET_PATH = "/content/hackerrank-orchestrate-june26/dataset"
-    if not os.path.exists(DATASET_PATH):
-        DATASET_PATH = "/content/hackerrank-orchestrate-june26"
+# 1. HISTORY AGENT
+class HistoryAgent:
+    def __init__(self, history_dataframe):
+        self.history_df = history_dataframe
 
-    # Safely load datasets with explicit error fallbacks
-    claims_df = pd.read_csv(os.path.join(DATASET_PATH, "claims.csv"))
-    
-    try:
-        history_df = pd.read_csv(os.path.join(DATASET_PATH, "user_history.csv"))
-    except Exception:
-        history_df = pd.DataFrame(columns=["user_id"])
-        
-    try:
-        req_df = pd.read_csv(os.path.join(DATASET_PATH, "requirements.csv"))
-    except Exception:
-        req_df = pd.DataFrame(columns=["claim_object"])
+    def analyze_user(self, user_id):
+        user_record = self.history_df[self.history_df['user_id'] == user_id]
+        if user_record.empty:
+            return {"user_id": user_id, "risk_profile": "medium_risk", "risk_score": 0.5}
 
-    # Initialize agent safely
-    try:
-        agent = LocalVisionAgent()
-        has_agent = True
-    except Exception:
-        print("⚠️ Model VRAM full. Swapped to production rule-based text verification engine.")
-        has_agent = False
+        row = user_record.iloc[0]
+        past_claims = row['past_claim_count']
+        manual_reviews = row['manual_review_claim']
+        rejected = row['rejected_claim']
+        recent_claims = row['last_90_days_claim_count']
+        flags = str(row['history_flags']).strip().lower()
 
-    final_rows = []
-    print(f"🚀 Commencing fault-tolerant processing for {len(claims_df)} claims...")
+        rejection_rate = rejected / past_claims if past_claims > 0 else 0
+        if flags != 'none' and flags != 'nan':
+            return {"user_id": user_id, "risk_profile": "high_risk", "risk_score": 0.9}
+        elif rejection_rate > 0.5 or manual_reviews > (past_claims * 0.5):
+            return {"user_id": user_id, "risk_profile": "high_risk", "risk_score": 0.8}
+        return {"user_id": user_id, "risk_profile": "low_risk", "risk_score": 0.1}
 
-    for idx, row in claims_df.iterrows():
-        user_id = row['user_id']
-        user_hist = history_df[history_df['user_id'] == user_id].to_dict(orient='records') if not history_df.empty else []
-        rules = req_df[req_df['claim_object'] == row['claim_object']].to_dict(orient='records') if not req_df.empty else []
-        
-        raw_analysis = None
-        if has_agent:
-            try:
-                raw_analysis = agent.evaluate_claim(row, user_hist, rules)
-            except Exception:
-                torch.cuda.empty_cache()
-                raw_analysis = "OOM Fallback: Visual validation metrics structurally inferred."
+# 2. PRODUCTION EVIDENCE AGENT
+class ProductionEvidenceAgent:
+    def __init__(self, client, requirements_dataframe):
+        self.client = client
+        self.req_df = requirements_dataframe
+        self.total_calls = 0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_images_processed = 0
 
-        if not raw_analysis:
-            raw_analysis = "Fallback: Textual claim data validated matching baseline criteria."
+    def _get_requirements_text(self, claim_object):
+        relevant_reqs = self.req_df[(self.req_df['claim_object'] == claim_object) | (self.req_df['claim_object'] == 'all')]
+        req_text = ""
+        for idx, row in relevant_reqs.iterrows():
+            req_text += f"- [{row['requirement_id']}]: {row['minimum_image_evidence']}\n"
+        return req_text
 
-        # Parse issue and parts cleanly out of the claim text string
-        claim_text = str(row['user_claim']).lower()
-        issue = "scratch"
-        if "dent" in claim_text or "bump" in claim_text:
-            issue = "dent"
-        elif "crack" in claim_text or "shatter" in claim_text:
-            issue = "crack"
-        elif "broken" in claim_text or "tear" in claim_text:
-            issue = "broken"
+    def evaluate_claim(self, claim_row, is_test=False):
+        user_id = claim_row['user_id']
+        conversation = claim_row['user_claim']
+        claim_object = claim_row['claim_object']
+        rules = self._get_requirements_text(claim_object)
 
-        part = "body"
-        if "bumper" in claim_text:
-            part = "front_bumper"
-        elif "screen" in claim_text or "display" in claim_text:
-            part = "screen"
-        elif "door" in claim_text:
-            part = "door"
+        image_contents, image_ids = [], []
+        paths = claim_row['image_paths'].split(';') if pd.notna(claim_row['image_paths']) else []
 
-        processed_record = {
-            "user_id": user_id,
-            "image_paths": row['image_paths'],
-            "user_claim": row['user_claim'],
-            "claim_object": row['claim_object'],
-            "evidence_standard_met": "true" if len(str(row['image_paths'])) > 5 else "false",
-            "evidence_standard_met_reason": "Visual claim assets validated against structural taxonomy standards.",
-            "risk_flags": "high_risk" if "risk" in str(user_hist).lower() or "fraud" in str(user_hist).lower() else "none",
-            "issue_type": issue,
-            "object_part": part,
-            "claim_status": "supported" if "high_risk" not in str(user_hist).lower() else "flagged",
-            "claim_status_justification": raw_analysis[:150].replace('\n', ' '),
-            "supporting_image_ids": "img_01",
-            "valid_image": "true",
-            "severity": "high" if "severe" in claim_text or "bad" in claim_text else "medium"
-        }
-        final_rows.append(processed_record)
-        
-        if (idx + 1) % 10 == 0 or (idx + 1) == len(claims_df):
-            print(f"📦 Successfully logged {idx + 1}/{len(claims_df)} rows...")
+        for path in paths:
+            clean_path = path.strip()
+            if not clean_path: continue
+            img_id = os.path.splitext(os.path.basename(clean_path))[0]
+            image_ids.append(img_id)
+            full_path = clean_path if clean_path.startswith("hackerrank-orchestrate-june26") else f"hackerrank-orchestrate-june26/dataset/{clean_path}"
+            if os.path.exists(full_path):
+                try:
+                    img = Image.open(full_path)
+                    image_contents.append(img)
+                    self.total_images_processed += 1
+                except: pass
 
-    # Write out the absolute complete results spreadsheet file
-    pd.DataFrame(final_rows).to_csv("output.csv", index=False)
-    print("🏆 Production Complete! output.csv generated completely filled.")
+        prompt = f"""You are an expert multi-modal fraud engine. Analyze this claim.
+        Object Type: {claim_object}
+        Conversation: {conversation}
+        Guidelines: {rules}
+        Respond strictly in JSON matching the submission schema requirements.
+        """
+
+        contents = [prompt] + image_contents
+        try:
+            self.total_calls += 1
+            response = self.client.models.generate_content(
+                model="gemini-2.5-flash", contents=contents,
+                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+            )
+            if response.usage_metadata:
+                self.total_input_tokens += response.usage_metadata.prompt_token_count
+                self.total_output_tokens += response.usage_metadata.candidates_token_count
+            return json.loads(response.text.strip().strip('`').replace('json', ''))
+        except Exception as e:
+            return {"evidence_standard_met": False, "claim_status": "not_enough_information", "issue_type": "unknown", "object_part": "unknown", "risk_flags": "none", "evidence_standard_met_reason": str(e), "claim_status_justification": "error", "supporting_image_ids": "none", "valid_image": False, "severity": "unknown"}
+
+# 3. PRODUCTION ORCHESTRATOR
+class ProductionOrchestrator:
+    def __init__(self, history_agent, evidence_agent):
+        self.history_agent = history_agent
+        self.evidence_agent = evidence_agent
+
+    def execute_pipeline(self, input_df, is_test=False):
+        final_rows = []
+        for idx, row in input_df.iterrows():
+            history_meta = self.history_agent.analyze_user(row['user_id'])
+            evidence_meta = self.evidence_agent.evaluate_claim(row, is_test=is_test)
+
+            combined_risk = evidence_meta.get("risk_flags", "none")
+            if history_meta.get("risk_profile") == "high_risk":
+                combined_risk = "user_history_risk" if combined_risk == "none" else f"{combined_risk};user_history_risk"
+
+            processed_record = {
+                "user_id": row['user_id'], "image_paths": row['image_paths'], "user_claim": row['user_claim'], "claim_object": row['claim_object'],
+                "evidence_standard_met": str(evidence_meta.get("evidence_standard_met", False)).lower(), "evidence_standard_met_reason": evidence_meta.get("evidence_standard_met_reason", ""),
+                "risk_flags": combined_risk, "issue_type": evidence_meta.get("issue_type", "unknown"), "object_part": evidence_meta.get("object_part", "unknown"),
+                "claim_status": evidence_meta.get("claim_status", "not_enough_information"), "claim_status_justification": evidence_meta.get("claim_status_justification", ""),
+                "supporting_image_ids": evidence_meta.get("supporting_image_ids", "none"), "valid_image": str(evidence_meta.get("valid_image", False)).lower(), "severity": evidence_meta.get("severity", "unknown")
+            }
+            final_rows.append(processed_record)
+            time.sleep(0.5)
+        return pd.DataFrame(final_rows)
 
 if __name__ == "__main__":
-    main()
+    print("Loading datasets...")
+    # Initialize your API client and datasets here if running locally
+    pass
